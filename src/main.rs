@@ -2,7 +2,7 @@ use std::env;
 use std::io::Write;
 use std::mem;
 use std::fs::{self, File};
-use std::io::{Seek, SeekFrom, Read, Cursor, self};
+use std::io::{Seek, SeekFrom, Read, self};
 use std::path::{Path, PathBuf};
 use std::convert::TryInto;
 use flate2::read::ZlibDecoder;
@@ -172,20 +172,20 @@ fn main() -> io::Result<()> {
 
     let mut bytes_read = 0;
 
-    let mut TOC: Vec<PyinstEntry> = Vec::new();
+    let mut toc: Vec<PyinstEntry> = Vec::new();
 
     let mut entry: PyinstEntry;
 
     while bytes_read < header.toc_size {
         entry = parse_entry(&mut fp, overlay_offset + tail_size);
         bytes_read += entry.size;
-        TOC.push(entry);
+        toc.push(entry);
     }
 
-    println!("Parsed {} entries", TOC.len());
+    println!("Parsed {} entries", toc.len());
 
 
-    TOC.par_iter().for_each( |entry| {
+    toc.par_iter().for_each( |entry| {
 
         let content = &file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize];
 
