@@ -22,9 +22,9 @@ This is my **first Rust project** learning Rust by building this extractor.
 Clone and build:
 
 ```bash
-git clone https://github.com/your-username/pyinstaller-extractor-rust.git
-cd pyinstaller-extractor-rust
-cargo build --release
+git clone https://github.com/lululepu/PyinstallerExtractor.git
+cd PyinstallerExtractor
+cargo build -r
 ```
 
 ---
