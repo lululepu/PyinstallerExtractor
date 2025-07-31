@@ -1,4 +1,3 @@
-use std::env;
 use std::io::Write;
 use std::mem;
 use std::fs::{self, File};
@@ -7,8 +6,23 @@ use std::path::{Path, PathBuf};
 use std::convert::TryInto;
 use flate2::read::ZlibDecoder;
 use rayon::prelude::*;
+use binrw::BinRead;
+use clap::Parser;
+use std::time::Instant;
 
-#[derive(Default)]
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    #[arg(short, long)]
+    input: String,
+
+    #[arg(short, long, default_value = "")]
+    output: String,
+}
+
+
+#[derive(Default, Debug)]
+#[allow(dead_code)]
 struct PyinstEntry {
     size: u32,
     offset: u32,
@@ -19,8 +33,9 @@ struct PyinstEntry {
     name: String
 }
 
-
-#[derive(Default)]
+#[allow(dead_code)]
+#[derive(BinRead)]
+#[br(big)]
 struct PyinstHeader {
     signature: [u8; 8],
     package_size: u32,
@@ -60,55 +75,48 @@ fn write_nested_file(base_path: &Path, file_path: &str, content: &[u8], compress
 
 fn parse_entry(fp: &mut File, overlay_offset: usize) -> PyinstEntry {
 
+    // not using binrw cause idk how to parse null-terminated dynamic sized strings
+
     let mut buffer = [0u8; 18];
     fp.read_exact(&mut buffer).expect("Read error");
 
     let size = u32::from_be_bytes(buffer[0..4].try_into().unwrap());
+    let offset = u32::from_be_bytes(buffer[4..8].try_into().unwrap()) + overlay_offset as u32;
+    let compressed_size = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
+    let uncompressed_size = u32::from_be_bytes(buffer[12..16].try_into().unwrap());
+    let compression_flag = buffer[16];
+    let type_ = buffer[17];
 
-    // TotalSize - ((Size) Size + (Offset) Size + (CompressedSize) Size + (UncompressedSize) Size + (CompressionFlag) Size + (type) Size)
-    let name_size = size - (mem::size_of::<u32>() as u32 * 4 + 1 + 1);
+    // name_size = TotalSize - ((Size) Size + (Offset) Size + (CompressedSize) Size + (UncompressedSize) Size + (CompressionFlag) Size + (type) Size)
+    let name_size = size - (4 * 4 + 1 + 1);
 
-    let mut entry: PyinstEntry = Default::default();
-    entry.size = size;
-    entry.offset = overlay_offset as u32 + u32::from_be_bytes(buffer[4..8].try_into().unwrap());
-    entry.compressed_size = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
-    entry.uncompressed_size = u32::from_be_bytes(buffer[12..16].try_into().unwrap());
-    entry.compression_flag = buffer[16];
-    entry.type_ = buffer[17];
-    
     let mut buffer: Vec<u8> = vec![0u8; name_size as usize];
 
     fp.read_exact(&mut buffer).expect("Read error");
     if let Some(pos) = buffer.iter().position(|&b| b == 0) {
         buffer.truncate(pos);
     }
-    entry.name = String::from_utf8(buffer).expect("Name error");
-
-    if !entry.name.contains('.') {
-        entry.name.push_str(".pyc");
+    let mut name = String::from_utf8(buffer).expect("Name error");
+    if !name.contains('.') {
+        name.push_str(".pyc");
     }
 
-    entry
+    PyinstEntry { 
+        size: size,
+        offset: offset,
+        compressed_size: compressed_size,
+        uncompressed_size: uncompressed_size,
+        compression_flag: compression_flag,
+        type_: type_,
+        name: name
+    }
+
 }
 
 fn parse_header(fp: &mut File, header_offset: usize) -> PyinstHeader {
 
-
-    let mut header: PyinstHeader = Default::default();
-
     fp.seek(SeekFrom::Start(header_offset as u64)).expect("Cannot seek to header");
-    
-    fp.read_exact(&mut header.signature).expect("Read error");
-    
-    let mut buffer = [0u8; 16];
-    
-    fp.read_exact(&mut buffer).expect("Read error");
-
-    header.package_size = u32::from_be_bytes(buffer[0..4].try_into().unwrap());
-    header.toc_offset = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
-    header.toc_size = u32::from_be_bytes(buffer[8..12].try_into().unwrap());
-    header.python_version = u32::from_be_bytes(buffer[12..16].try_into().unwrap());
-
+    let header = PyinstHeader::read(fp).expect("Error reading header");
     fp.rewind().expect("Rewind error");
 
     header
@@ -126,20 +134,21 @@ fn find_header(fp: &mut File) -> Option<usize> {
 }
 
 fn main() -> io::Result<()> {
-    let args: Vec<String> = env::args().collect();
-    
-    if args.len() < 2 {
-        println!("Usage: {} [file_path]", args[0]);
-        std::process::exit(1);
+    let start = Instant::now();
+
+    let args = Args::parse();
+
+    println!("Extracting {}", args.input);
+
+    let mut base_path = PathBuf::new();
+
+    if args.output.len() > 0 {
+        base_path.push(args.output);
+    } else {
+        base_path.push(format!("{}_extracted", args.input));
     }
 
-    let file_path = &args[1];
-
-    println!("Extracting {}", file_path);
-
-    let base_path = PathBuf::from(format!("{}_extracted", file_path));
-
-    let mut fp = File::open(file_path)?;
+    let mut fp = File::open(args.input)?;
 
     let mut file_content: Vec<u8> = Vec::new();
     fp.read_to_end(&mut file_content).expect("Cannot read file");
@@ -165,10 +174,10 @@ fn main() -> io::Result<()> {
     
     let overlay_offset = filesize - header.package_size as usize - tail_size;
 
-    println!("Package Size: {}\nToc Size: {}\nPython Version: {}.{}", header.package_size, header.toc_size, (header.python_version/100) as i32, (header.python_version%100) as i32);
+    println!("Package Size: {}\nToc Size: {}\nToc Offset: {:#2X}\nPython Version: {}.{}", header.package_size, header.toc_size, header.toc_offset,(header.python_version/100) as i32, (header.python_version%100) as i32);
 
     
-    fp.seek(SeekFrom::Start(overlay_offset as u64 + header.toc_offset as u64 + tail_size as u64)).expect("Seek error"); 
+    fp.seek(SeekFrom::Start(overlay_offset as u64 + header.toc_offset as u64 + 64)).expect("Seek error"); 
 
     let mut bytes_read = 0;
 
@@ -177,7 +186,7 @@ fn main() -> io::Result<()> {
     let mut entry: PyinstEntry;
 
     while bytes_read < header.toc_size {
-        entry = parse_entry(&mut fp, overlay_offset + tail_size);
+        entry = parse_entry(&mut fp, overlay_offset + 64);
         bytes_read += entry.size;
         toc.push(entry);
     }
@@ -195,6 +204,9 @@ fn main() -> io::Result<()> {
     });
 
     println!("Extracted as: {}", base_path.to_str().expect("!"));
+
+    let duration = start.elapsed();
+    println!("Dump took: {} ms", duration.as_millis());
 
     Ok(())
 }

@@ -45,6 +45,8 @@ In `Cargo.toml`:
 
 ```toml
 [dependencies]
+binrw = "0.15.0"
+clap = { version = "4.5.42", features = ["derive"] }
 flate2 = "1.0"
 rayon = "1.7"
 ```
