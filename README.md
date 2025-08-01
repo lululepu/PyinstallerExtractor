@@ -13,7 +13,6 @@ This is my **first Rust project** learning Rust by building this extractor.
 ## Requirements
 
 - Rust and Cargo  
-- Crates: `flate2` and `rayon`
 
 ---
 
