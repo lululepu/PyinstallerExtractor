@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::mem;
 use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Read, self};
@@ -9,6 +9,25 @@ use rayon::prelude::*;
 use binrw::BinRead;
 use clap::Parser;
 use std::time::Instant;
+use std::io::BufWriter;
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+const ARCHIVE_ITEM_PYZ: u8             = b'z'; // zlib (pyz) - frozen Python code
+const ARCHIVE_ITEM_PYSOURCE: u8        = b's'; // Python script (v3)
+/*
+const ARCHIVE_ITEM_BINARY: u8          = b'b'; // binary
+const ARCHIVE_ITEM_DEPENDENCY: u8      = b'd'; // runtime option
+const ARCHIVE_ITEM_ZIPFILE: u8         = b'Z'; // zlib (pyz) - frozen Python code
+const ARCHIVE_ITEM_PYPACKAGE: u8       = b'M'; // Python package (__init__.py)
+const ARCHIVE_ITEM_PYMODULE: u8        = b'm'; // Python module
+const ARCHIVE_ITEM_DATA: u8            = b'x'; // data
+const ARCHIVE_ITEM_RUNTIME_OPTION: u8  = b'o'; // runtime option
+const ARCHIVE_ITEM_SPLASH: u8          = b'l'; // splash resources
+const ARCHIVE_ITEM_SYMLINK: u8         = b'n'; // symbolic link
+*/
 
 #[derive(Parser, Debug)]
 #[command(author, version, about)]
@@ -44,32 +63,64 @@ struct PyinstHeader {
     python_version: u32
 }
 
-const MAGIC_BASE: [u8; 8] = [
+#[allow(dead_code)]
+#[derive(BinRead)]
+#[br(little)]
+struct PyzHeader {
+    magic: [u8; 4],
+    version: [u8; 4],
+    toc_offset: u32
+}
+
+
+
+const PYINST_MAGIC_BASE: [u8; 8] = [
     b'M', b'E', b'I', 0x0C,
     0x0B, 0x0A, 0x0B, 0x0E
 ];
 
-fn write_nested_file(base_path: &Path, file_path: &str, content: &[u8], compressed: bool) -> io::Result<()> {
+fn write_nested_file(base_path: &Path, entry: &PyinstEntry, file_content: &[u8], pyc_magic: [u8; 16]) -> io::Result<()> {
 
-    let full_path = base_path.join(file_path.replace("\\", "/"));
+    let full_path = if entry.name.contains('\\') {
+        base_path.join(entry.name.replace("\\", "/"))
+    } else {
+        base_path.join(&entry.name)
+    };
+
+    let content = &file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize];
 
     if full_path.exists() {
         return Ok(());
     }
 
     if let Some(parent) = full_path.parent() {
-        let _ = fs::create_dir_all(parent);
+        fs::create_dir_all(parent)?;
     }
 
-    let mut file = fs::File::create(&full_path)?;
-    if compressed {
+    let file = fs::File::create(&full_path)?;
+    let mut writer = BufWriter::new(file);
+
+    if entry.compression_flag == 1 {
         let mut decoder = ZlibDecoder::new(content);
-        io::copy(&mut decoder, &mut file)?;
+
+        // if valid magic add it
+        if pyc_magic[0] != 0 && entry.type_ == ARCHIVE_ITEM_PYSOURCE {
+            writer.write_all(&pyc_magic)?;
+        }
+
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let len = decoder.read(&mut buf)?;
+            if len == 0 {
+                break;
+            }
+            writer.write_all(&buf[..len])?;
+        }
     } else {
-        file.write_all(content)?;
+        writer.write_all(content)?;
     }
 
-
+    writer.flush()?;
     Ok(())
 }
 
@@ -96,8 +147,10 @@ fn parse_entry(fp: &mut File, overlay_offset: usize) -> PyinstEntry {
     if let Some(pos) = buffer.iter().position(|&b| b == 0) {
         buffer.truncate(pos);
     }
+    
     let mut name = String::from_utf8(buffer).expect("Name error");
-    if !name.contains('.') {
+
+    if type_ == ARCHIVE_ITEM_PYSOURCE {
         name.push_str(".pyc");
     }
 
@@ -120,17 +173,6 @@ fn parse_header(fp: &mut File, header_offset: usize) -> PyinstHeader {
     fp.rewind().expect("Rewind error");
 
     header
-}
-
-fn find_header(fp: &mut File) -> Option<usize> {
-
-    let mut content: Vec<u8> = Vec::new();
-    fp.read_to_end(&mut content).expect("Cannot read file");
-
-    let signature: &[u8] = &MAGIC_BASE;
-
-    content.windows(8).position(|window| window == signature)
-    
 }
 
 fn main() -> io::Result<()> {
@@ -156,7 +198,10 @@ fn main() -> io::Result<()> {
     fp.rewind().expect("Rewind error");
     
 
-    let offset = find_header(&mut fp).expect("Invalid pyinstaller file");
+    let signature: &[u8] = &PYINST_MAGIC_BASE;
+    
+    let offset  = file_content.windows(8).position(|window| window == signature).expect("Invalid pyinstaller archive");
+
     println!("Got header offset at: {:#2X}", offset);
 
 
@@ -185,28 +230,41 @@ fn main() -> io::Result<()> {
 
     let mut entry: PyinstEntry;
 
+    let mut pyc_magic = [0u8; 16];
+
     while bytes_read < header.toc_size {
         entry = parse_entry(&mut fp, overlay_offset + 64);
+
+        if entry.type_ == ARCHIVE_ITEM_PYZ {
+            let mut content = Cursor::new(&file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize]);
+
+            let pyz_header = PyzHeader::read(&mut content).expect("Invalid pyz header");
+
+            pyc_magic[..4].copy_from_slice(&pyz_header.version);
+        }
+
         bytes_read += entry.size;
         toc.push(entry);
     }
 
     println!("Parsed {} entries", toc.len());
+    let duration = start.elapsed();
+    println!("Parsing took: {} ms", duration.as_millis());
+    if pyc_magic[0] == 0 {
+        println!("Cannot find the python header...");
+    }
+    let start = Instant::now();
 
-
-    toc.par_iter().for_each( |entry| {
-
-        let content = &file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize];
-
-        let compressed = entry.compression_flag == 1;
-
-        write_nested_file(base_path.as_path(), entry.name.as_str(), content, compressed).expect("Write error");
+    toc.par_chunks(8).for_each(|chunk| {
+        for entry in chunk {
+            write_nested_file(base_path.as_path(), entry, &file_content, pyc_magic).expect("Write error");
+        }
     });
 
     println!("Extracted as: {}", base_path.to_str().expect("!"));
 
     let duration = start.elapsed();
-    println!("Dump took: {} ms", duration.as_millis());
+    println!("Extraction took: {} ms", duration.as_millis());
 
     Ok(())
 }
