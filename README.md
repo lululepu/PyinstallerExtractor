@@ -32,11 +32,8 @@ cargo build -r
 ## Usage
 
 ```bash
-extractor.exe [/path/to/file.exe]
+extractor.exe -i [test.exe] -o [output]
 ```
-
-Files are extracted to a folder named `{filename}_extracted`.
-
 ---
 
 ## Dependencies
