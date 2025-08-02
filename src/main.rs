@@ -4,7 +4,7 @@ use std::fs::{self, File};
 use std::io::{Seek, SeekFrom, Read, self};
 use std::path::{Path, PathBuf};
 use std::convert::TryInto;
-use flate2::read::ZlibDecoder;
+use libdeflater::Decompressor;
 use rayon::prelude::*;
 use binrw::BinRead;
 use clap::Parser;
@@ -87,11 +87,11 @@ fn write_nested_file(base_path: &Path, entry: &PyinstEntry, file_content: &[u8],
         base_path.join(&entry.name)
     };
 
-    let content = &file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize];
-
     if full_path.exists() {
         return Ok(());
     }
+
+    let content = &file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize];
 
     if let Some(parent) = full_path.parent() {
         fs::create_dir_all(parent)?;
@@ -101,21 +101,16 @@ fn write_nested_file(base_path: &Path, entry: &PyinstEntry, file_content: &[u8],
     let mut writer = BufWriter::new(file);
 
     if entry.compression_flag == 1 {
-        let mut decoder = ZlibDecoder::new(content);
+        let mut decoder = Decompressor::new();
+        let mut output = vec![0u8; entry.uncompressed_size as usize];
 
+        decoder.zlib_decompress(content, &mut output).expect("Decompression failed");
         // if valid magic add it
         if pyc_magic[0] != 0 && entry.type_ == ARCHIVE_ITEM_PYSOURCE {
             writer.write_all(&pyc_magic)?;
         }
+        writer.write_all(&output)?;
 
-        let mut buf = [0u8; 64 * 1024];
-        loop {
-            let len = decoder.read(&mut buf)?;
-            if len == 0 {
-                break;
-            }
-            writer.write_all(&buf[..len])?;
-        }
     } else {
         writer.write_all(content)?;
     }
@@ -255,10 +250,8 @@ fn main() -> io::Result<()> {
     }
     let start = Instant::now();
 
-    toc.par_chunks(8).for_each(|chunk| {
-        for entry in chunk {
-            write_nested_file(base_path.as_path(), entry, &file_content, pyc_magic).expect("Write error");
-        }
+    toc.par_iter().for_each(|entry|  {
+        write_nested_file(base_path.as_path(), entry, &file_content, pyc_magic).expect("Write error");
     });
 
     println!("Extracted as: {}", base_path.to_str().expect("!"));
