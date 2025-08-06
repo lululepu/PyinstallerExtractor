@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::io::{Cursor, Write};
 use std::mem;
 use std::fs::{self, File};
@@ -11,6 +12,14 @@ use clap::Parser;
 use std::time::Instant;
 use std::io::BufWriter;
 use mimalloc::MiMalloc;
+use memchr::memmem;
+use memmap2::Mmap;
+
+
+thread_local! {
+    static DECOMPRESSOR: RefCell<Decompressor> = RefCell::new(Decompressor::new());
+}
+
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -72,8 +81,6 @@ struct PyzHeader {
     toc_offset: u32
 }
 
-
-
 const PYINST_MAGIC_BASE: [u8; 8] = [
     b'M', b'E', b'I', 0x0C,
     0x0B, 0x0A, 0x0B, 0x0E
@@ -101,11 +108,12 @@ fn write_nested_file(base_path: &Path, entry: &PyinstEntry, file_content: &[u8],
     let mut writer = BufWriter::new(file);
 
     if entry.compression_flag == 1 {
-        let mut decoder = Decompressor::new();
         let mut output = vec![0u8; entry.uncompressed_size as usize];
+        DECOMPRESSOR.with(|decompressor| {
+            let mut decompressor = decompressor.borrow_mut();
+            decompressor.zlib_decompress(content, &mut output).expect("Decompression failed");
+        });
 
-        decoder.zlib_decompress(content, &mut output).expect("Decompression failed");
-        // if valid magic add it
         if pyc_magic[0] != 0 && entry.type_ == ARCHIVE_ITEM_PYSOURCE {
             writer.write_all(&pyc_magic)?;
         }
@@ -187,19 +195,23 @@ fn main() -> io::Result<()> {
 
     let mut fp = File::open(args.input)?;
 
-    let mut file_content: Vec<u8> = Vec::new();
-    fp.read_to_end(&mut file_content).expect("Cannot read file");
-    let filesize = file_content.len();
-    fp.rewind().expect("Rewind error");
+
+    let mmap = unsafe { Mmap::map(&fp)? };
+    let filesize = mmap.len() as usize;
     
 
     let signature: &[u8] = &PYINST_MAGIC_BASE;
+
+    let search_len = 1 * 1024 * 1024;
+    let sstart = mmap.len().saturating_sub(search_len);
+    let slice = &mmap[sstart..];
+    let rel_offset  = memmem::find(&slice, signature).expect("Invalid pyinstaller archive");
     
-    let offset  = file_content.windows(8).position(|window| window == signature).expect("Invalid pyinstaller archive");
-
+    let offset = sstart + rel_offset;
+    
     println!("Got header offset at: {:#2X}", offset);
-
-
+ 
+  
     // To count useless tail Bytes 
     fp.seek(SeekFrom::Start((offset + mem::size_of::<PyinstHeader>()) as u64)).expect("Seek error"); 
     
@@ -226,12 +238,14 @@ fn main() -> io::Result<()> {
     let mut entry: PyinstEntry;
 
     let mut pyc_magic = [0u8; 16];
+    
 
+    
     while bytes_read < header.toc_size {
         entry = parse_entry(&mut fp, overlay_offset + 64);
 
         if entry.type_ == ARCHIVE_ITEM_PYZ {
-            let mut content = Cursor::new(&file_content[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize]);
+            let mut content = Cursor::new(&mmap[entry.offset as usize .. (entry.offset + entry.compressed_size) as usize]);
 
             let pyz_header = PyzHeader::read(&mut content).expect("Invalid pyz header");
 
@@ -242,7 +256,7 @@ fn main() -> io::Result<()> {
         toc.push(entry);
     }
 
-    println!("Parsed {} entries", toc.len());
+    println!("Parsed{} entries", toc.len());
     let duration = start.elapsed();
     println!("Parsing took: {} ms", duration.as_millis());
     if pyc_magic[0] == 0 {
@@ -251,7 +265,7 @@ fn main() -> io::Result<()> {
     let start = Instant::now();
 
     toc.par_iter().for_each(|entry|  {
-        write_nested_file(base_path.as_path(), entry, &file_content, pyc_magic).expect("Write error");
+        write_nested_file(base_path.as_path(), entry, &mmap, pyc_magic).expect("Write error");
     });
 
     println!("Extracted as: {}", base_path.to_str().expect("!"));
@@ -261,3 +275,4 @@ fn main() -> io::Result<()> {
 
     Ok(())
 }
+ 

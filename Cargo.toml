@@ -1,6 +1,6 @@
 [package]
 name = "extractor"
-version = "1.0.3"
+version = "1.0.34"
 edition = "2024"
 
 [dependencies]
@@ -10,6 +10,8 @@ rayon = "1.10"
 mimalloc = "0.1.47"
 libdeflater = "1.24.0"
 crossbeam = "0.8.4"
+memchr = "2.7.5"
+memmap2 = "0.9.7"
 
 [profile.release]
 opt-level = 3
